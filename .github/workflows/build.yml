@@ -1,0 +1,268 @@
+# Builds unofficial multi-arch images of Prusa Connect from the upstream
+# sources and pushes them to GHCR and, when configured, Docker Hub.
+#
+#   upstream branch  feat/foo      -> :feat-foo, :feat-foo-<sha12>
+#   upstream tag     v0.2.0        -> :0.2.0 (+ :latest for the highest stable release)
+#
+# Runs daily and builds only what changed (see scripts/plan.sh), on demand for
+# one ref, on a push to main of this repository, and as a build-only check on
+# pull requests.
+name: build
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream branch or tag (e.g. main, v0.1.0-beta.1). Empty builds everything that needs it.
+        required: false
+        default: ""
+      force:
+        description: Rebuild even when the image is up to date
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UPSTREAM: prusa3d/prusa-connect
+  IMAGE_NAME: prusa-connect-unofficial
+  # Build tags on top of what the shipped config selects, as the upstream
+  # release binaries do: Prometheus metrics and the PostgreSQL driver.
+  EXTRA_BUILD_TAGS: observability postgres
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+      count: ${{ steps.plan.outputs.count }}
+      platforms: ${{ steps.plan.outputs.platforms }}
+      ghcr_image: ${{ steps.names.outputs.ghcr_image }}
+      dockerhub_image: ${{ steps.names.outputs.dockerhub_image }}
+      recipe: ${{ steps.names.outputs.recipe }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - id: names
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || vars.DOCKERHUB_USERNAME }}
+        run: |
+          owner=$(tr '[:upper:]' '[:lower:]' <<<"$REPO_OWNER")
+          echo "ghcr_image=ghcr.io/$owner/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          if [ -n "$DOCKERHUB_NAMESPACE" ]; then
+            echo "dockerhub_image=docker.io/$(tr '[:upper:]' '[:lower:]' <<<"$DOCKERHUB_NAMESPACE")/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          fi
+          # Everything that shapes the image. A change rebuilds every branch.
+          recipe=$(cat .github/workflows/build.yml scripts/patch-dockerfile.sh | sha256sum | cut -c1-12)
+          echo "recipe=$recipe" >> "$GITHUB_OUTPUT"
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: plan
+        env:
+          IMAGE: ${{ steps.names.outputs.ghcr_image }}
+          RECIPE: ${{ steps.names.outputs.recipe }}
+          EVENT: ${{ github.event_name }}
+          ONLY_REF: ${{ inputs.ref }}
+          INPUT_FORCE: ${{ inputs.force }}
+          BRANCH_INCLUDE: ${{ vars.BRANCH_INCLUDE }}
+          BRANCH_EXCLUDE: ${{ vars.BRANCH_EXCLUDE }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            # A pull request only proves that the recipe still builds.
+            export ONLY_REF=main FORCE=true
+            platforms='[{"name":"linux/amd64","slug":"amd64","runner":"ubuntu-24.04"}]'
+          else
+            export FORCE="${INPUT_FORCE:-false}"
+            # No linux/arm/v7: every bundled extension is built for 64-bit
+            # platforms only (see their module.yaml), and parts does not compile
+            # on 32-bit.
+            platforms='[{"name":"linux/amd64","slug":"amd64","runner":"ubuntu-24.04"},{"name":"linux/arm64","slug":"arm64","runner":"ubuntu-24.04-arm"}]'
+          fi
+          [ -n "${BRANCH_INCLUDE:-}" ] || unset BRANCH_INCLUDE
+          [ -n "${BRANCH_EXCLUDE:-}" ] || unset BRANCH_EXCLUDE
+          targets=$(bash scripts/plan.sh)
+          {
+            echo "targets=$targets"
+            echo "count=$(jq length <<<"$targets")"
+            echo "platforms=$platforms"
+          } >> "$GITHUB_OUTPUT"
+          jq -r '.[] | "- \(.kind) `\(.name)` at `\(.sha[0:12])` -> `:\(.tag)`"' <<<"$targets" > plan.md
+          { echo "### Plan"; echo; if [ -s plan.md ]; then cat plan.md; else echo "Everything is up to date."; fi; } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+        platform: ${{ fromJSON(needs.plan.outputs.platforms) }}
+    # Each platform builds natively on its own runner, no QEMU.
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: recipe
+          persist-credentials: false
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ matrix.target.sha }}
+          path: upstream
+          persist-credentials: false
+
+      - id: version
+        env:
+          KIND: ${{ matrix.target.kind }}
+          VERSION: ${{ matrix.target.version }}
+          SHA: ${{ matrix.target.sha }}
+        run: |
+          # The same string upstream's scripts/build-version.sh prints: the
+          # release for a tag, VERSION+<commit> for anything else.
+          if [ "$KIND" = tag ]; then
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(tr -d '[:space:]' < upstream/VERSION)+${SHA:0:12}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: bash recipe/scripts/patch-dockerfile.sh upstream
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: upstream
+          file: upstream/docker/server/Dockerfile
+          platforms: ${{ matrix.platform.name }}
+          build-args: |
+            BUILD_VERSION=${{ steps.version.outputs.version }}
+            EXTRA_BUILD_TAGS=${{ env.EXTRA_BUILD_TAGS }}
+            UPGRADE_PUBLIC_KEYS=${{ vars.UPGRADE_PUBLIC_KEYS }}
+          labels: |
+            org.opencontainers.image.title=Prusa Connect (unofficial image)
+            org.opencontainers.image.description=Unofficial build of Prusa Connect by Prusa Research a.s. Not affiliated with or endorsed by Prusa Research.
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ matrix.target.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ env.UPSTREAM }}
+            org.opencontainers.image.licenses=LicenseRef-OCL-1.1-Micro-1-NoSaaS-1-SWAtt-1
+            org.opencontainers.image.vendor=Prusa Research a.s. (upstream), built by ${{ github.repository_owner }}
+            prusa-connect-unofficial.recipe=${{ needs.plan.outputs.recipe }}
+            prusa-connect-unofficial.upstream-ref=${{ matrix.target.name }}
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.plan.outputs.ghcr_image) }}
+          cache-from: type=gha,scope=${{ matrix.platform.slug }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope={0},mode=max', matrix.platform.slug) || '' }}
+
+      - if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: digests-${{ matrix.target.key }}-${{ matrix.platform.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    # One failed target (say, arm64 of a feature branch) must not hold back the
+    # others; the digest count below catches the target it belongs to.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && github.event_name != 'pull_request' && needs.plan.outputs.count != '0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.target.key }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: needs.plan.outputs.dockerhub_image != ''
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - env:
+          GHCR_IMAGE: ${{ needs.plan.outputs.ghcr_image }}
+          DOCKERHUB_IMAGE: ${{ needs.plan.outputs.dockerhub_image }}
+          KIND: ${{ matrix.target.kind }}
+          TAG: ${{ matrix.target.tag }}
+          EXTRA_TAGS: ${{ matrix.target.extra_tags }}
+          SHA: ${{ matrix.target.sha }}
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
+        run: |
+          tags=("$TAG")
+          [ "$KIND" = branch ] && tags+=("$TAG-${SHA:0:12}")
+          for extra in $EXTRA_TAGS; do tags+=("$extra"); done
+
+          args=()
+          for image in $GHCR_IMAGE $DOCKERHUB_IMAGE; do
+            for tag in "${tags[@]}"; do args+=(-t "$image:$tag"); done
+          done
+
+          cd "$RUNNER_TEMP/digests"
+          sources=()
+          for digest in *; do sources+=("$GHCR_IMAGE@sha256:$digest"); done
+          expected=$(jq length <<<"$PLATFORMS")
+          test "${#sources[@]}" -eq "$expected" || { echo "::error::expected $expected platform digests, got ${#sources[@]}"; exit 1; }
+
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "$GHCR_IMAGE:$TAG"
+          {
+            echo "### \`$TAG\`"
+            for a in "${args[@]}"; do [ "$a" = -t ] || echo "- \`$a\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,9 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Leave a new release two weeks to settle before it builds images.
+    cooldown:
+      default-days: 14
